@@ -1,0 +1,212 @@
+
+/*======================================================================
+The function of this callback is to retrive the texture and audio files from Alienbrain automatically.
+The flag "autoGetLatest" will determine if the texture file should be overwrited if it is not the latest version.
+==========================================================================*/
+
+#include <maya/MPxCommand.h>
+#include <maya/MArgList.h>
+#include <maya/MGlobal.h>
+#include <maya/MDGMessage.h>
+#include <maya/MPlug.h>
+#include <maya/MString.h>
+#include <maya/MNodeMessage.h>
+#include <maya/MFnDependencyNode.h>
+#include <maya/MCallbackIdArray.h>
+#include <maya/MIntArray.h>
+
+#include "preNodeAdd.h"
+
+using namespace std;
+
+bool isAutoGetlatestNodeFile = 0;
+int isPreNodeAdd = 0;
+
+void resolvePath(MString &path){
+	// remove string "../"
+	int pos = -1;
+	while( (pos = path.indexW("../")) != -1){
+		MString upper = path.substringW(0, pos-2);
+		MString lower = path.substringW(pos +3, -1);
+		upper = upper.substringW(0, upper.rindexW("/"));
+		path = upper + lower;
+		//MGlobal::displayInfo(MString("********new path**********") + path);
+	}
+}
+
+preNodeAddCmd::~preNodeAddCmd() {}
+
+void attributeChangeCallback( MNodeMessage::AttributeMessage msg, MPlug &plug, MPlug &otherPlug, void *clientData )
+{
+	MString cmd;
+	MStatus stat;
+
+	cmd = MString("abMEL_PluginCheck;");
+	stat = MGlobal::executeCommand(cmd);
+
+	if ( msg & MNodeMessage::kAttributeSet ) 
+	{
+		if( plug.partialName() == MString("fileTextureName") || plug.partialName() == MString("ftn") || plug.partialName() == MString("filename") || plug.partialName() == MString("f") )
+		{	
+			//file path management
+			MString fileName;
+			plug.getValue(fileName);
+
+			//	we must remove the callback before set the new value to attribute, or we will get into infinity recycle loop
+			int *index = (int*)clientData;
+			stat = MMessage::removeCallback( attributeChangeCallbackIds[index[0]] );
+			callbackIndex.remove(index[0]);
+
+			if( fileName.length() != 0 )
+			{
+				MString	projectPath;	
+				cmd = MString("workspace -q -rd");
+				stat = MGlobal::executeCommand(cmd, projectPath);
+				MString newfileName = projectPath + fileName;	
+
+				// check if project path should be added
+				cmd = MString("gmatch \""+newfileName+"\" \"*:*:*\"" );
+				int isMatch = 0;
+				stat = MGlobal::executeCommand(cmd, isMatch);
+				if(isMatch)
+					newfileName = fileName;
+		
+				resolvePath(newfileName);
+		
+				if(isAutoGetlatestNodeFile)
+				{
+					cmd = MString("abMEL_GetLatestVersion \""+newfileName+"\";");
+					stat = MGlobal::executeCommand(cmd);
+				}
+				else
+				{
+					int result = 0;
+					cmd = MString("filetest -r \""+newfileName+"\";");
+					stat = MGlobal::executeCommand(cmd, result);
+					if( result == 0 )
+					{
+						cmd = MString("abMEL_GetLatestVersion \""+newfileName+"\";");
+						stat = MGlobal::executeCommand(cmd);
+					}
+				}
+			}
+		}
+	}
+}
+
+
+void addNodeCallback( MObject& node, void *clientData )
+{
+	MStatus 		stat;
+
+	//MGlobal::displayInfo(MString("Running preNodeAdd procedure..."));
+
+
+	//	When Maya initialize the node, the value of attribute hasn't been set yet
+	//	in order to get value and modify it, we have to register another callback with "addAttributeChangedCallback"
+
+	//	There will be lots of texture file nodes need to be registered addAttributeChangedCallback callback 
+	//	we have to make sure each specific callback will be remove in the end of callback function
+	//	so here we used MIntArray to store the callback index for current file node, and passed by client data pointer in callback function
+
+	callbackIndex.append(attributeChangeCallbackIds.length());
+	MCallbackId id = MNodeMessage:: addAttributeChangedCallback(node, attributeChangeCallback, &callbackIndex[callbackIndex.length()-1], &stat);
+	attributeChangeCallbackIds.append(id);
+	
+}
+
+void* preNodeAddCmd::creator()
+{
+	return new preNodeAddCmd();
+}
+
+
+MStatus preNodeAddCmd::doIt( const MArgList& args )
+{
+	MStatus 		stat;
+    MCallbackId     id;
+
+	
+	// Parse the arguments.
+	for ( unsigned i = 0; i < args.length(); i++ )
+	{
+		if ( MString( "-q" ) == args.asString( i, &stat ) && MS::kSuccess == stat )
+		{
+			MString comp = args.asString( i+1, &stat );
+			if(MS::kSuccess == stat)
+			{
+				if ( MString( "-enable" ) == comp )
+				{
+					setResult( isPreNodeAdd );
+					return MS::kSuccess;
+				}
+				else if ( MString( "-autoGetLatest" ) == comp )
+				{
+					setResult( isAutoGetlatestNodeFile );
+					return MS::kSuccess;
+				}
+			}
+			else
+				return MS::kFailure;
+		}		
+		else if ( MString( "-enable" ) == args.asString( i, &stat ) && MS::kSuccess == stat )
+		{
+			int result = args.asInt( ++i, &stat );
+			if ( !stat )			
+				return MS::kFailure;
+			if(result > 0)
+				isPreNodeAdd = 1;
+			else
+				isPreNodeAdd = 0;
+		
+		}
+		else if ( MString( "-autoGetLatest" ) == args.asString( i, &stat ) && MS::kSuccess == stat )
+		{
+			int result = args.asInt( ++i, &stat );
+			if ( !stat )			
+				return MS::kFailure;
+			if(result > 0)
+				isAutoGetlatestNodeFile = 1;
+			else
+				isAutoGetlatestNodeFile = 0;
+		}		
+		else
+		{
+			MString msg = "Invalid flag of preNodeAdd: ";
+			msg += args.asString( i );
+			displayError( msg );
+			return MS::kFailure;
+		}			
+	}
+
+	if(isPreNodeAdd)
+	{
+		if ( addNodeCallbackIds.length() == 0 )
+		{		
+			//register textrue file node add callback
+			id = MDGMessage::addNodeAddedCallback ( addNodeCallback, MString("file") ,NULL, &stat );
+			if (stat)			
+				addNodeCallbackIds.append( id );			
+			else
+				MGlobal::displayError(MString("Register callback failed :")+stat.errorString());
+
+			//register audio file node add callback
+			id = MDGMessage::addNodeAddedCallback ( addNodeCallback, MString("audio") ,NULL, &stat );
+			if (stat)			
+				addNodeCallbackIds.append( id );			
+			else
+				MGlobal::displayError(MString("Register callback failed :")+stat.errorString());
+		}
+	}
+	else
+	{
+		for (unsigned int i=0; i< addNodeCallbackIds.length(); i++ )
+			MMessage::removeCallback( (MCallbackId)addNodeCallbackIds[i] );
+
+		for (unsigned int i=0; i< attributeChangeCallbackIds.length(); i++ )
+			MMessage::removeCallback( (MCallbackId)attributeChangeCallbackIds[i] );
+	}
+	
+
+	return stat;
+}
